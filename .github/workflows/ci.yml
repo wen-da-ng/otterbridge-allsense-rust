@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --examples
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The test kit (fake phone + scenarios) comes from otterbridge-allsense-protocol. Until allsense-testkit
+      # is on PyPI it's installed from that repo; while the repo is private, add a read-only TESTKIT_TOKEN secret.
+      - uses: actions/checkout@v4
+        with:
+          repository: wen-da-ng/otterbridge-allsense-protocol
+          token: ${{ secrets.TESTKIT_TOKEN || github.token }}
+          path: _testkit
+      - run: pip install ./_testkit
+      - name: Conformance
+        shell: bash
+        run: |
+          d=target/debug/examples
+          allsense-conformance --example $d/quickstart --example $d/print_values -- $d/conformance
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo build

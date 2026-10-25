@@ -1,0 +1,19 @@
+[package]
+name = "allsense"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Stream sensors, cameras and microphones from an Android phone running OtterBridge AllSense"
+license = "MIT"
+repository = "https://github.com/wen-da-ng/otterbridge-allsense-rust"
+homepage = "https://docs.allsense.otterbridge.org/get-started/rust/"
+documentation = "https://docs.allsense.otterbridge.org/get-started/rust/"
+keywords = ["robotics", "sensors", "android", "imu", "websocket"]
+categories = ["science::robotics", "hardware-support"]
+readme = "README.md"
+# Notes for working on the repo, not part of the crate.
+exclude = ["CLAUDE.md", "CLAUDE.local.md", ".github/", "_testkit/"]
+
+[dependencies]
+serde_json = "1.0.154"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
