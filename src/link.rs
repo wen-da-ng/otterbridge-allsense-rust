@@ -4,14 +4,20 @@ use crate::error::{Error, Result};
 pub const DEFAULT_PORT: u16 = 8765;
 
 /// Where the phone is: parsed from the app's link (`http://192.168.1.20:8765/?token=abcd`),
-/// a `ws://` URL, `"ip"` or `"ip:port"`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// a `ws://` URL, `"ip"` or `"ip:port"`. Its `Debug` output hides the token.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Link {
     /// Host name or IP address (IPv6 without brackets).
     pub host: String,
     pub port: u16,
     /// The pairing token shown in the app.
     pub token: String,
+}
+
+impl std::fmt::Debug for Link {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Link").field("host", &self.host).field("port", &self.port).field("token", &"<hidden>").finish()
+    }
 }
 
 impl Link {
@@ -94,6 +100,18 @@ impl Link {
     }
 }
 
+/// Checks a path the phone sent in its catalog (a camera's or microphone's `url`) before it goes
+/// after `http://host:port`: it must start with `/` and hold no `@`, `\`, spaces or control
+/// characters, so it can't send the request (and the token) to another host or split the request.
+pub(crate) fn check_path(path: &str) -> Result<&str> {
+    let bad = |c: char| c == '@' || c == '\\' || c.is_whitespace() || c.is_control();
+    if path.starts_with('/') && !path.contains(bad) {
+        Ok(path)
+    } else {
+        Err(Error::Connect(format!("The phone sent a media URL this client won't use: {path:?}")))
+    }
+}
+
 fn percent_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -108,21 +126,20 @@ fn percent_encode(s: &str) -> String {
 
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16);
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = |c: u8| (c as char).to_digit(16);
-                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                    (Some(h), Some(l)) => {
-                        out.push((h * 16 + l) as u8);
-                        i += 3;
-                        continue;
-                    }
-                    _ => out.push(b'%'),
+            // Two hex digits after the `%` (up to the very end) make an escape; anything else stays as is.
+            b'%' => match bytes.get(i + 1..i + 3).map(|h| (hex(h[0]), hex(h[1]))) {
+                Some((Some(h), Some(l))) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
                 }
-            }
+                _ => out.push(b'%'),
+            },
             b'+' => out.push(b' '),
             b => out.push(b),
         }
@@ -169,5 +186,53 @@ mod tests {
         assert!(matches!(Link::parse("http://1.2.3.4:8765/", None), Err(Error::Token(_))));
         assert_eq!(Link::parse("http://1.2.3.4/?token=a", Some("b")).unwrap().token, "b");
         assert!(matches!(Link::parse("https://1.2.3.4/?token=a", None), Err(Error::Connect(_))));
+    }
+
+    #[test]
+    fn percent_escapes() {
+        assert_eq!(percent_decode("a%41"), "aA"); // an escape at the very end
+        assert_eq!(percent_decode("%41%42"), "AB");
+        assert_eq!(percent_decode("x%2"), "x%2");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert_eq!(percent_decode("%e9%"), "\u{fffd}%"); // a lone byte that isn't UTF-8
+        assert_eq!(percent_decode("é%C3%A9+"), "éé ");
+        // Nothing short and odd panics, multi-byte characters after a `%` included.
+        let parts = ["%", "4", "1", "g", "é", "+", "%f"];
+        for a in parts {
+            for b in parts {
+                for c in parts {
+                    percent_decode(&format!("{a}{b}{c}"));
+                }
+            }
+        }
+        assert_eq!(Link::parse("1.2.3.4/?token=ab%2", None).unwrap().token, "ab%2");
+    }
+
+    #[test]
+    fn debug_hides_the_token() {
+        let l = Link::parse("http://1.2.3.4:8765/?token=secret123", None).unwrap();
+        let shown = format!("{l:?}");
+        assert!(!shown.contains("secret123") && shown.contains("1.2.3.4"), "{shown}");
+    }
+
+    #[test]
+    fn media_paths() {
+        assert_eq!(check_path("/camera/back.mjpg").unwrap(), "/camera/back.mjpg");
+        assert!(check_path("/mic/a%20b.wav").is_ok());
+        for bad in [
+            "",
+            "camera/back.mjpg",
+            "@evil.example/x",
+            "/x@evil.example",
+            "\\\\evil.example\\x",
+            "/a\\b",
+            "/a\r\nHost: evil",
+            "/a\nb",
+            "/a b",
+            "http://evil.example/x",
+        ] {
+            assert!(matches!(check_path(bad), Err(Error::Connect(_))), "{bad:?}");
+        }
     }
 }

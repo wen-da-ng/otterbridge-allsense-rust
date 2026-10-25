@@ -11,14 +11,30 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::frame::coding::CloseCode;
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
 use crate::error::{Error, Result, TOKEN_REJECTED};
 use crate::http;
-use crate::link::Link;
+use crate::link::{check_path, Link};
 
 /// How long the reader thread naps when there's nothing to read or send.
 const POLL: Duration = Duration::from_millis(2);
+
+/// The largest message (and frame) taken from the phone: the Python client's limit. A catalog is a few kB.
+const MAX_MESSAGE: usize = 4 << 20;
+/// How much unsent data (our messages, pong replies) may wait while the phone isn't reading: past it
+/// the connection counts as lost, instead of memory growing without bound.
+const MAX_UNSENT: usize = 4 << 20;
+
+/// Bounds for everything the WebSocket holds: tungstenite's own default write buffer is unlimited.
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE))
+        .write_buffer_size(0)
+        .max_write_buffer_size(MAX_UNSENT)
+}
 
 /// One stream the phone offers, from its catalog (<https://docs.allsense.otterbridge.org/PROTOCOL/>).
 #[derive(Debug, Clone)]
@@ -193,8 +209,8 @@ pub enum Codec {
     H264,
 }
 
-/// Connection settings. `Options::new().name("my_robot").connect(link)`.
-#[derive(Debug, Clone)]
+/// Connection settings. `Options::new().name("my_robot").connect(link)`. `Debug` hides the token.
+#[derive(Clone)]
 pub struct Options {
     name: String,
     token: Option<String>,
@@ -218,6 +234,21 @@ impl Default for Options {
             queue_len: 1000,
             quiet: false,
         }
+    }
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("name", &self.name)
+            .field("token", &self.token.as_ref().map(|_| "<hidden>"))
+            .field("timeout", &self.timeout)
+            .field("reconnect", &self.reconnect)
+            .field("stall_timeout", &self.stall_timeout)
+            .field("wait", &self.wait)
+            .field("queue_len", &self.queue_len)
+            .field("quiet", &self.quiet)
+            .finish()
     }
 }
 
@@ -456,7 +487,7 @@ impl Inner {
         stream.set_read_timeout(Some(self.opts.timeout))?;
         stream.set_write_timeout(Some(self.opts.timeout))?;
         let handle = stream.try_clone()?;
-        match tungstenite::client::client(self.link.ws_url(), stream) {
+        match tungstenite::client::client_with_config(self.link.ws_url(), stream, Some(ws_config())) {
             Ok((ws, _)) => {
                 ws.get_ref().set_nonblocking(true)?;
                 *lock(&self.sock) = Some(handle);
@@ -507,6 +538,9 @@ impl Inner {
                 match ws.send(Message::text(text)) {
                     Ok(()) => {}
                     Err(e) if would_block(&e) => unflushed = true,
+                    Err(tungstenite::Error::WriteBufferFull(_)) => {
+                        return Ended::Lost("the phone stopped reading what we send".into())
+                    }
                     Err(e) => return Ended::Lost(format!("sending: {e}")),
                 }
             }
@@ -985,6 +1019,7 @@ impl Phone {
                 info.raw["h264_url"].as_str().map(str::to_string).unwrap_or_else(|| mjpg.replace(".mjpg", ".h264"))
             }
         };
+        check_path(&path)?;
         let mut q = Vec::new();
         if let Some(s) = &opts.size {
             q.push(("size", s.clone()));
@@ -1034,6 +1069,7 @@ impl Phone {
     pub fn microphone_url(&self, name: &str, rate: u32) -> Result<String> {
         let info = self.media(name, "audio")?;
         let path = info.raw["url"].as_str().map(str::to_string).unwrap_or_else(|| format!("/mic/{}.wav", info.name));
+        check_path(&path)?;
         Ok(self.inner.link.http_url(&path, &[("rate", rate.to_string())]))
     }
 
@@ -1304,6 +1340,63 @@ mod tests {
         assert!(s.get("z").unwrap().is_nan());
         assert_eq!(s.get("w"), None);
         assert_eq!(s.pairs()[3].0, "v3");
+    }
+
+    /// A loopback WebSocket pair: (our client end with `ws_config()`, the "phone" end).
+    fn ws_pair() -> (WebSocket<TcpStream>, WebSocket<TcpStream>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let phone = thread::spawn(move || tungstenite::accept(listener.accept().unwrap().0).unwrap());
+        let stream = TcpStream::connect(addr).unwrap();
+        let (ws, _) = tungstenite::client::client_with_config(format!("ws://{addr}/ws"), stream, Some(ws_config()))
+            .map_err(|e| e.to_string())
+            .unwrap();
+        (ws, phone.join().unwrap())
+    }
+
+    #[test]
+    fn oversized_message_is_refused() {
+        let (mut ws, mut phone) = ws_pair();
+        let sender = thread::spawn(move || {
+            let _ = phone.send(Message::text("x".repeat(MAX_MESSAGE + 1)));
+            phone
+        });
+        let got = ws.read();
+        assert!(matches!(got, Err(tungstenite::Error::Capacity(_))), "{got:?}");
+        drop(ws);
+        drop(sender.join());
+        // One just within the limit still arrives.
+        let (mut ws, mut phone) = ws_pair();
+        let sender = thread::spawn(move || phone.send(Message::text("y".repeat(MAX_MESSAGE - 64))).is_ok());
+        assert_eq!(ws.read().unwrap().len(), MAX_MESSAGE - 64);
+        assert!(sender.join().unwrap());
+    }
+
+    #[test]
+    fn unsent_data_is_bounded() {
+        // The phone never reads: sends must fail with WriteBufferFull, not grow memory without end.
+        let (mut ws, _phone) = ws_pair();
+        ws.get_ref().set_nonblocking(true).unwrap();
+        let chunk = "z".repeat(256 << 10);
+        let mut full = false;
+        for _ in 0..(64 << 20) / chunk.len() {
+            match ws.send(Message::text(chunk.clone())) {
+                Ok(()) => {}
+                Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(tungstenite::Error::WriteBufferFull(_)) => {
+                    full = true;
+                    break;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(full, "the write buffer never filled up");
+    }
+
+    #[test]
+    fn debug_hides_the_token() {
+        let shown = format!("{:?}", Options::new().token("secret123"));
+        assert!(!shown.contains("secret123") && shown.contains("hidden"), "{shown}");
     }
 
     #[test]
